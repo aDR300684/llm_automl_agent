@@ -1,0 +1,34 @@
+# .gitignore
+
+# Environnements virtuels
+.venv/
+venv/
+
+# Fichiers de config secrets
+.env
+
+# Fichiers Python compilés
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Dossiers temporaires / cache
+*.log
+*.tmp
+*.bak
+*.swp
+*.DS_Store
+.ipynb_checkpoints/
+.cache/
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
+
+# Données utilisateur / output
+outputs/
+data/
+*.csv
+*.json
