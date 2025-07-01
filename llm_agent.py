@@ -18,16 +18,20 @@ load_dotenv()
 client = OpenAI()
 
 
-def call_openai(prompt: str, model="gpt-4.1-2025-04-14", temperature=0.3):
-    response = client.chat.completions.create(
-        model=model,
-        temperature=temperature,
-        messages=[
-            {"role": "system", "content": "You are a helpful and precise ML assistant."},
-            {"role": "user", "content": prompt}
-        ]
-    )
-    return response.choices[0].message.content
+def call_openai(prompt: str, model="gpt-4.1-2025-04-14", temperature=0.2):
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            temperature=temperature,
+            timeout=60,  # Prevent freeze if API stalls
+            messages=[
+                {"role": "system", "content": "You are a helpful and precise ML assistant."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"[ERROR] OpenAI API failed: {str(e)}"
 
 
 def strip_code_fences(text: str) -> str:
@@ -45,34 +49,63 @@ def summarize_dataset(df: pd.DataFrame, target_col: str):
     n_rows, n_cols = df.shape
     column_names = df.columns.tolist()
 
+    # Missing values
     nan_summary = "\n".join([
         f"- {col}: {df[col].isna().sum()} missing ({df[col].isna().mean()*100:.1f}%)"
         for col in df.columns if df[col].isna().sum() > 0
     ]) or "None"
 
+    # Data types grouped
     type_groups = df.dtypes.groupby(df.dtypes).groups
     dtypes = "\n".join([
         f"- {dtype}: {list(cols)}" for dtype, cols in type_groups.items()
     ])
 
-    return column_names, n_rows, n_cols, nan_summary, dtypes
+    # Unique value counts
+    unique_counts = "\n".join([
+        f"- {col}: {df[col].nunique()} unique"
+        for col in df.columns if col != target_col
+    ])
+
+    # Optional: Example values for top 3 object columns
+    example_values = "\n".join([
+        f"- {col}: {df[col].dropna().unique()[:5].tolist()}"
+        for col in df.select_dtypes(include="object").columns[:3]
+    ]) or "None"
+
+    return {
+        "column_names": column_names,
+        "n_rows": n_rows,
+        "n_cols": n_cols,
+        "nan_summary": nan_summary,
+        "dtypes": dtypes,
+        "unique_counts": unique_counts,
+        "example_values": example_values
+    }
+
 
 
 def run_llm_pipeline(csv_path: str, target_col: str) -> str:
     log = []
     df = pd.read_csv(csv_path)
-    column_names, n_rows, n_cols, nan_summary, dtypes = summarize_dataset(df, target_col)
+    summary = summarize_dataset(df, target_col)
 
     # Step 1: Strategy generation
     log.append("[LLM_AGENT] Step 1: Analyzing dataset...")
-    prompt1 = build_prompt_dataset_analysis(column_names, n_rows, n_cols, nan_summary, dtypes, target_col)
+    prompt1 = build_prompt_dataset_analysis(summary, target_col)
+    log.append("[LLM_AGENT] Step 1: Calling OpenAI to generate strategy...")
     strategy_text = call_openai(prompt1)
+
+    if strategy_text.startswith("[ERROR]"):
+        log.append(strategy_text)
+        return "\n".join(log)
+
     log.append("[LLM_AGENT] ✅ Strategy received:")
     log.append(strategy_text)
 
     # Step 2: Feature engineering
     log.append("\n[LLM_AGENT] Step 2: Generating feature engineering script...")
-    fe_prompt = build_prompt_feature_engineering(column_names, target_col, csv_path)
+    fe_prompt = build_prompt_feature_engineering(strategy_text, csv_path)
     fe_code = strip_code_fences(call_openai(fe_prompt))
 
     with open("feature_engineering.py", "w", encoding="utf-8") as f:
@@ -98,40 +131,25 @@ def run_llm_pipeline(csv_path: str, target_col: str) -> str:
         log.append(e.stderr)
         return "\n".join(log)
 
-    # Step 3: Model code generation (now using dataset_FE.csv)
-    log.append("\n[LLM_AGENT] Step 3: Generating training pipeline...")
-    prompt3 = build_prompt_generate_code(strategy_text, target_col, "dataset_FE.csv")
+    # Step 3: Model code generation (dataset_FE.csv structure + strategy)
+    log.append("\n[LLM_AGENT] Step 3: Summarizing dataset_FE.csv for modeling...")
+    df_fe = pd.read_csv("dataset_FE.csv")
+    summary_fe = summarize_dataset(df_fe, target_col)
+
+    log.append("[LLM_AGENT] ✅ Summary of dataset_FE.csv completed.")
+
+    log.append("[LLM_AGENT] Step 3: Generating modeling script based on FE dataset and strategy...")
+    prompt3 = build_prompt_generate_code(
+        target_col=target_col,
+        csv_path="dataset_FE.csv",
+        strategy_text=strategy_text,
+            summary_dict=summary_fe
+    )
     train_code = strip_code_fences(call_openai(prompt3))
 
     with open("generated_code.py", "w", encoding="utf-8") as f:
         f.write(train_code)
 
-    # Append model saving line
-    with open("generated_code.py", "a", encoding="utf-8") as f:
-        f.write("\n\nimport joblib\njoblib.dump(clf, 'pipeline_model.pkl')")
-
-    # Append actual vs predicted + feature importances (safe version, no pandas re-import)
-    with open("generated_code.py", "a", encoding="utf-8") as f:
-        f.write(textwrap.dedent("""
-            # Postprocessing: Actual vs Predicted + Feature Importances
-
-            # Show a preview of y_true vs y_pred
-            preview = pd.DataFrame({
-                "y_true": y_test,
-                "y_pred": y_pred
-            }).reset_index(drop=True)
-            print("y_true vs y_pred (first 10 rows):")
-            print(preview.head(10).to_string(index=False))
-
-            # Feature importances if supported
-            if hasattr(clf.named_steps["classifier"], "feature_importances_"):
-                importances = clf.named_steps["classifier"].feature_importances_
-                feature_names = clf.named_steps["preprocessor"].get_feature_names_out()
-                sorted_idx = np.argsort(importances)[::-1]
-                print("\\nFeature Importances (sorted):")
-                for idx in sorted_idx:
-                    print(f"{feature_names[idx]}: {importances[idx]:.4f}")
-        """))
 
     log.append("[LLM_AGENT] ✅ Code saved to generated_code.py. Running it now...")
 

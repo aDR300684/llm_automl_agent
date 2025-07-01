@@ -121,6 +121,8 @@ class AutoMLGUI(QWidget):
             return
 
         self.log(f"\n[RUN] Running AutoML agent on target column: '{target}'...")
+        self.log("[INFO] Launching background LLM agent. This may take up to a minute if GPT is slow...")
+
 
         # Start worker in new thread
         self.thread = QThread()
